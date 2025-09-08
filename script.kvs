@@ -1,0 +1,151 @@
+# KV Store Batch Operations Test
+# This file demonstrates various store operations
+
+# Print initial stats
+stats
+
+# Insert multiple key-value pairs
+set user:1:name John Doe
+set user:1:email john.doe@example.com
+set user:1:age 35
+set user:1:city New York
+set user:1:occupation Software Engineer
+
+set user:2:name Jane Smith
+set user:2:email jane.smith@example.com 
+set user:2:age 28
+set user:2:city San Francisco
+set user:2:occupation Data Scientist
+
+set user:3:name Bob Johnson
+set user:3:email bob.johnson@example.com
+set user:3:age 42
+set user:3:city Chicago
+set user:3:occupation Product Manager
+
+# Insert some standalone keys
+set app:version 1.2.3
+set app:author KV Store Team
+set app:license MIT
+set config:max_connections 100
+set config:timeout 30
+
+# Show all keys after insertion
+keys
+
+# Get specific values
+get user:1:name
+get user:2:email
+get app:version
+get config:timeout
+
+# Check if some keys exist
+exists user:1:name
+exists user:999:name  # This should not exist
+exists app:license
+
+# Update some values
+set user:1:age 36  # Birthday update!
+set user:2:city Seattle  # Moved cities
+set app:version 1.3.0  # Version upgrade
+set config:max_connections 150  # Increased capacity
+
+# Verify updates
+get user:1:age
+get user:2:city
+get app:version
+get config:max_connections
+
+# Delete some keys
+del user:3:occupation
+del app:author
+del config:timeout
+
+# Verify deletions
+exists user:3:occupation  # Should be gone
+exists app:author  # Should be gone
+exists config:timeout  # Should be gone
+
+# Try to get deleted keys (should return nil)
+get user:3:occupation
+get app:author
+
+# Delete an entire user
+del user:3:name
+del user:3:email
+del user:3:age
+del user:3:city
+
+# Verify user 3 is mostly gone
+exists user:3:name
+keys  # Show remaining keys
+
+# Insert some special values
+set empty_value   # Empty string
+set long_key this_is_a_very_long_key_name_that_should_work_fine_1234567890
+set special_chars key-with-dashes_and_underscores+plus@symbols
+
+# Test special characters in values
+set html_content <html><body><h1>Hello World</h1></body></html>
+set json_data {name: test, value: 42, active: true}
+set multiline Line 1\nLine 2\nLine 3
+
+# Get special values
+get empty_value
+get long_key
+get special_chars
+get html_content
+
+# Show final stats
+stats
+
+# Bulk insertion example
+set batch:item:1 value1
+set batch:item:2 value2
+set batch:item:3 value3
+set batch:item:4 value4
+set batch:item:5 value5
+
+# Bulk deletion
+del batch:item:1
+del batch:item:2
+del batch:item:3
+del batch:item:4
+del batch:item:5
+
+# Verify bulk operations
+exists batch:item:1
+keys
+
+# Final cleanup - delete everything we created
+del user:1:name
+del user:1:email
+del user:1:age
+del user:1:city
+del user:1:occupation
+
+del user:2:name
+del user:2:email
+del user:2:age
+del user:2:city
+del user:2:occupation
+
+del app:version
+del app:license
+del config:max_connections
+
+del empty_value
+del long_key
+del special_chars
+del html_content
+del json_data
+del multiline
+
+# Final verification
+keys
+stats
+
+# Save the store (empty at this point)
+save
+
+quit
