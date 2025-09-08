@@ -12,13 +12,15 @@ extern "C" {
 #endif
 
 // Version and constants
-#define KVSTORE_VERSION_MAJOR 1
+#define KVSTORE_VERSION_MAJOR 2
 #define KVSTORE_VERSION_MINOR 0
 #define KVSTORE_VERSION_PATCH 0
 
-#define KVSTORE_DEFAULT_CAPACITY 1024
-#define KVSTORE_MAX_STRING_SIZE  (1024 * 1024)  // 1MB limit
-#define KVSTORE_MAGIC_HEADER     0x4B56DB00
+#define KVSTORE_DEFAULT_CAPACITY    1024
+#define KVSTORE_MAX_STRING_SIZE     (1024 * 1024)  // 1MB limit
+#define KVSTORE_MAGIC_HEADER        0x4B56DB01     // Updated magic for v2
+#define KVSTORE_DEFAULT_LOAD_FACTOR 0.75
+#define KVSTORE_MIN_CAPACITY        16
 
 // Error codes
 typedef enum {
@@ -39,11 +41,13 @@ typedef struct {
     char* data;
 } kvstore_string_t;
 
-// Key-value pair
-typedef struct {
+// Hash table entry with separate chaining
+typedef struct kvstore_entry {
     kvstore_string_t key;
     kvstore_string_t value;
-} kvstore_pair_t;
+    struct kvstore_entry* next;
+    uint32_t hash;  // Cached hash value
+} kvstore_entry_t;
 
 // Forward declaration
 typedef struct kvstore kvstore_t;
@@ -54,6 +58,7 @@ void kvstore_destroy(kvstore_t* store);
 kvstore_error_t kvstore_clear(kvstore_t* store);
 size_t kvstore_size(const kvstore_t* store);
 size_t kvstore_capacity(const kvstore_t* store);
+double kvstore_load_factor(const kvstore_t* store);
 
 // Core API - Key-Value operations
 kvstore_error_t kvstore_put(kvstore_t* store, const char* key_data, uint32_t key_len, const char* value_data,
@@ -76,13 +81,14 @@ kvstore_error_t kvstore_save(const kvstore_t* store, const char* filename);
 // Iteration API
 typedef struct {
     const kvstore_t* store;
-    size_t index;
+    size_t bucket_index;
+    const kvstore_entry_t* current_entry;
 } kvstore_iterator_t;
 
 kvstore_iterator_t kvstore_iter_begin(const kvstore_t* store);
 bool kvstore_iter_valid(const kvstore_iterator_t* iter);
 void kvstore_iter_next(kvstore_iterator_t* iter);
-const kvstore_pair_t* kvstore_iter_get(const kvstore_iterator_t* iter);
+const kvstore_entry_t* kvstore_iter_get(const kvstore_iterator_t* iter);
 
 // Utility functions
 const char* kvstore_error_string(kvstore_error_t error);

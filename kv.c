@@ -37,9 +37,8 @@ static config_t g_config  = {
      .auto_save_interval = 60,
 };
 
-static bool g_running              = true;
-static pthread_mutex_t store_mutex = PTHREAD_MUTEX_INITIALIZER;
-// Global flag for immediate exit
+static bool g_running                         = true;
+static pthread_mutex_t store_mutex            = PTHREAD_MUTEX_INITIALIZER;
 static volatile sig_atomic_t g_immediate_exit = 0;
 
 // Logging levels
@@ -177,11 +176,13 @@ static bool validate_key(const char* key) {
         logger(LOG_DEBUG, "Key validation failed: null or empty key");
         return false;
     }
+
     if (strlen(key) > KVSTORE_MAX_STRING_SIZE) {
         logger(LOG_DEBUG, "Key validation failed: key too long (%zu > %u)", strlen(key),
                KVSTORE_MAX_STRING_SIZE);
         return false;
     }
+
     // Add any other key restrictions here
     return true;
 }
@@ -468,8 +469,8 @@ static int cmd_keys(int argc, char** argv) {
     size_t i                = 1;
 
     while (kvstore_iter_valid(&iter)) {
-        const kvstore_pair_t* pair = kvstore_iter_get(&iter);
-        printf("  %zu) \"%.*s\"\n", i++, (int)pair->key.len, pair->key.data);
+        const kvstore_entry_t* entry = kvstore_iter_get(&iter);
+        printf("  %zu) \"%.*s\"\n", i++, (int)entry->key.len, entry->key.data);
         kvstore_iter_next(&iter);
     }
     UNLOCK_STORE();
