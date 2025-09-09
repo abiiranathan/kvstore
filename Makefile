@@ -10,13 +10,13 @@ CFLAGS = -std=c23 -Wall -Wextra -Wpedantic -Wformat=2 -Wundef -Wshadow \
 		 -D_GNU_SOURCE
 
 # Debug build flags
-DEBUG_CFLAGS = -std=c23 -Wall -Wextra -g3 -O0 -DDEBUG -fsanitize=address,undefined
+DEBUG_CFLAGS = -std=c23 -Wall -Wextra -g3 -O0 -DDEBUG -fsanitize=address,undefined -D_GNU_SOURCE
 
 # Release build flags  
-RELEASE_CFLAGS = -std=c23 -Wall -Wextra -O3 -DNDEBUG -flto
+RELEASE_CFLAGS = -std=c23 -Wall -Wextra -O3 -DNDEBUG -flto -D_GNU_SOURCE
 
 # Libraries
-LIBS = -lreadline
+LIBS = -lreadline -lcjson -lm
 
 # Directories
 SRCDIR = src
@@ -29,8 +29,8 @@ TESTDIR = tests
 EXAMPLEDIR = examples
 
 # Source files
-LIB_SOURCES = kvstore.c
-CLI_SOURCES = kv.c
+LIB_SOURCES = kvstore.c alloc.c arena.c
+CLI_SOURCES = kv.c alloc.c arena.c
 TEST_SOURCES = $(wildcard $(TESTDIR)/*.c)
 EXAMPLE_SOURCES = $(wildcard $(EXAMPLEDIR)/*.c)
 
@@ -93,7 +93,7 @@ $(OBJDIR)/%.o: %.c kvstore.h | $(OBJDIR)
 	$(CC) $(CFLAGS) -c -o $@ $<
 
 # Object files for CLI
-$(OBJDIR)/kv-cli.o: kv-cli.c kvstore.h | $(OBJDIR)
+$(OBJDIR)/kv-cli.o: kv.c alloc.c alloc.h kvstore.h | $(OBJDIR)
 	@echo "Compiling CLI: $<"
 	$(CC) $(CFLAGS) -c -o $@ $< 
 

@@ -1,4 +1,4 @@
-#include "kvstore.h"
+#include <stdio.h>
 
 #include <errno.h>
 #include <getopt.h>
@@ -14,6 +14,10 @@
 #include <sys/resource.h>
 #include <sys/time.h>
 #include <time.h>
+
+#include "kvstore.h"
+
+#include "alloc.h"
 
 #define DEFAULT_DB_FILE   "kvstore.db"
 #define MAX_COMMAND_LEN   4096
@@ -347,7 +351,7 @@ static int cmd_set(int argc, char** argv) {
         }
     } else {
         // Multiple arguments, concatenate them
-        char* value = malloc(value_len + 1);
+        char* value = MALLOC(value_len + 1);
         if (!value) {
             print_error("set", KVSTORE_ERROR_MEMORY, "Value allocation failed");
             return 1;
@@ -365,7 +369,7 @@ static int cmd_set(int argc, char** argv) {
         kvstore_error_t error = kvstore_put_str(g_store, argv[1], value);
         UNLOCK_STORE();
 
-        free(value);
+        FREE(value);
 
         if (error != KVSTORE_OK) {
             print_error("set", error, NULL);
@@ -810,6 +814,7 @@ static void cleanup(void) {
     }
 
     logger(LOG_INFO, "Cleanup completed");
+    PRINT_ALLOC_STATS();
 }
 
 // Interactive REPL
