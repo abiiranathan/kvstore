@@ -1,4 +1,4 @@
-#include "kvstore.h"
+#include "../include/kvstore.h"
 #include <ctype.h>
 #include <errno.h>
 #include <fcntl.h>
@@ -11,14 +11,134 @@
 
 #define MAGIC_NUMBER 0x4B56DB02
 
+// Arena/Memory Pool Configuration
+#define ARENA_BLOCK_SIZE (size_t)(64 * 1024)  // 64KB blocks
+#define ARENA_ALIGNMENT  (size_t)8            // 8-byte alignment for all allocations
+
+// Arena block structure
+typedef struct arena_block {
+    struct arena_block* next;
+    size_t size;
+    size_t used;
+    char data[];
+} arena_block_t;
+
+// Arena allocator structure
+typedef struct arena {
+    arena_block_t* blocks;
+    arena_block_t* current;
+    size_t total_allocated;
+    size_t total_used;
+} arena_t;
+
 // Internal store structure with hash table and arena allocator
 struct kvstore {
     kvstore_entry_t** buckets;
     size_t bucket_count;
     size_t entry_count;
     double max_load_factor;
-    arena_t* arena;
+    arena_t arena;
 };
+
+// Arena allocator functions
+static size_t align_size(size_t size) {
+    return (size + ARENA_ALIGNMENT - 1) & ~(ARENA_ALIGNMENT - 1);
+}
+
+static arena_block_t* arena_create_block(size_t min_size) {
+    size_t block_size = ARENA_BLOCK_SIZE;
+    if (min_size > block_size - sizeof(arena_block_t)) {
+        block_size = min_size + sizeof(arena_block_t);
+    }
+
+    arena_block_t* block = malloc(block_size);
+    if (!block) return NULL;
+
+    block->next = NULL;
+    block->size = block_size - sizeof(arena_block_t);
+    block->used = 0;
+    return block;
+}
+
+static void arena_init(arena_t* arena) {
+    memset(arena, 0, sizeof(arena_t));
+}
+
+static void* arena_alloc(arena_t* arena, size_t size) {
+    if (size == 0) return NULL;
+
+    size = align_size(size);
+
+    // Try to allocate from current block
+    if (arena->current && arena->current->used + size <= arena->current->size) {
+        void* ptr = arena->current->data + arena->current->used;
+        arena->current->used += size;
+        arena->total_used += size;
+        return ptr;
+    }
+
+    // Need a new block
+    arena_block_t* new_block = arena_create_block(size);
+    if (!new_block) return NULL;
+
+    // Link the new block
+    if (arena->current) {
+        new_block->next = arena->blocks;
+        arena->blocks   = arena->current;
+    }
+    arena->current = new_block;
+    arena->total_allocated += new_block->size + sizeof(arena_block_t);
+
+    // Allocate from the new block
+    void* ptr       = new_block->data;
+    new_block->used = size;
+    arena->total_used += size;
+    return ptr;
+}
+
+static void arena_destroy(arena_t* arena) {
+    // Free current block
+    if (arena->current) {
+        free(arena->current);
+        arena->current = NULL;
+    }
+
+    // Free all other blocks
+    arena_block_t* block = arena->blocks;
+    while (block) {
+        arena_block_t* next = block->next;
+        free(block);
+        block = next;
+    }
+
+    memset(arena, 0, sizeof(arena_t));
+}
+
+static void arena_clear(arena_t* arena) {
+    // Reset all blocks to unused state
+    if (arena->current) {
+        arena->current->used = 0;
+    }
+
+    arena_block_t* block = arena->blocks;
+    while (block) {
+        block->used = 0;
+        block       = block->next;
+    }
+
+    // Move all blocks back to the main list and use the first one as current
+    if (arena->current) {
+        arena->current->next = arena->blocks;
+        arena->blocks        = arena->current;
+        arena->current       = arena->blocks;
+        if (arena->current) {
+            arena->blocks        = arena->current->next;
+            arena->current->next = NULL;
+        }
+    }
+
+    arena->total_used = 0;
+}
 
 // Hash function using FNV-1a algorithm
 static uint32_t hash_key(const char* data, uint32_t len) {
@@ -49,9 +169,10 @@ static uint32_t ntohl_portable(uint32_t netlong) {
 
 static uint64_t htonll_portable(uint64_t hostlonglong) {
     static const int endian_test = 1;
-    if (*(char*)&endian_test == 1) {
-        return ((uint64_t)htonl_portable(hostlonglong & 0xFFFFFFFF) << 32) |
-               htonl_portable(hostlonglong >> 32);
+    if (*(char*)&endian_test == 1) {                            // Little-endian
+        uint32_t low  = (uint32_t)(hostlonglong & 0xFFFFFFFF);  // lower 32 bits, already fits into uint32_t
+        uint32_t high = (uint32_t)(hostlonglong >> 32);         // upper 32 bits, may implicitly truncate
+        return ((uint64_t)htonl_portable(high) << 32) | htonl_portable(low);
     }
     return hostlonglong;
 }
@@ -69,9 +190,9 @@ static ssize_t read_full(int fd, void* buf, size_t size) {
         ssize_t bytes_read = read(fd, ptr, remaining);
         if (bytes_read <= 0) return bytes_read;
         ptr += bytes_read;
-        remaining -= bytes_read;
+        remaining -= (size_t)bytes_read;
     }
-    return size;
+    return (ssize_t)size;
 }
 
 static ssize_t write_full(int fd, const void* buf, size_t size) {
@@ -82,9 +203,9 @@ static ssize_t write_full(int fd, const void* buf, size_t size) {
         ssize_t bytes_written = write(fd, ptr, remaining);
         if (bytes_written <= 0) return bytes_written;
         ptr += bytes_written;
-        remaining -= bytes_written;
+        remaining -= (size_t)bytes_written;
     }
-    return size;
+    return (ssize_t)size;
 }
 
 // String utilities using arena allocator
@@ -111,9 +232,33 @@ kvstore_string_t kvstore_string_create(const char* data, uint32_t len) {
     return s;
 }
 
+// Arena-based string creation for internal use
+static kvstore_string_t kvstore_string_create_arena(arena_t* arena, const char* data, uint32_t len) {
+    kvstore_string_t s = {0};
+    if (!arena || (!data && len > 0)) {
+        return s;
+    }
+    if (len > KVSTORE_MAX_STRING_SIZE) {
+        return s;
+    }
+
+    s.data = arena_alloc(arena, len + 1);
+    if (!s.data) {
+        return s;
+    }
+
+    if (len > 0) {
+        memcpy(s.data, data, len);
+    }
+
+    s.data[len] = '\0';
+    s.len       = len;
+    return s;
+}
+
 kvstore_string_t kvstore_string_from_cstr(const char* cstr) {
     if (!cstr) return (kvstore_string_t){0};
-    return kvstore_string_create(cstr, strlen(cstr));
+    return kvstore_string_create(cstr, (uint32_t)strlen(cstr));
 }
 
 void kvstore_string_destroy(kvstore_string_t* str) {
@@ -171,6 +316,25 @@ kvstore_value_t kvstore_value_create_binary(const void* data, uint32_t len) {
     return val;
 }
 
+// Arena-based value creation for internal use
+static kvstore_value_t kvstore_value_create_string_arena(arena_t* arena, const char* data, uint32_t len) {
+    kvstore_value_t val = {.type = KVSTORE_TYPE_STRING, .data = {{0}}};
+    val.data.str_val    = kvstore_string_create_arena(arena, data, len);
+    if (!val.data.str_val.data && len > 0) {
+        val.type = KVSTORE_TYPE_NULL;
+    }
+    return val;
+}
+
+static kvstore_value_t kvstore_value_create_binary_arena(arena_t* arena, const void* data, uint32_t len) {
+    kvstore_value_t val = {.type = KVSTORE_TYPE_BINARY, .data = {{0}}};
+    val.data.binary_val = kvstore_string_create_arena(arena, (const char*)data, len);
+    if (!val.data.binary_val.data && len > 0) {
+        val.type = KVSTORE_TYPE_NULL;
+    }
+    return val;
+}
+
 void kvstore_value_destroy(kvstore_value_t* value) {
     if (!value) return;
 
@@ -187,6 +351,28 @@ void kvstore_value_destroy(kvstore_value_t* value) {
 
     value->type = KVSTORE_TYPE_NULL;
     memset(&value->data, 0, sizeof(value->data));
+}
+
+static kvstore_value_t kvstore_value_copy_arena(arena_t* arena, const kvstore_value_t* src) {
+    if (!src) return kvstore_value_create_null();
+
+    switch (src->type) {
+        case KVSTORE_TYPE_NULL:
+            return kvstore_value_create_null();
+        case KVSTORE_TYPE_STRING:
+            return kvstore_value_create_string_arena(arena, src->data.str_val.data, src->data.str_val.len);
+        case KVSTORE_TYPE_INT64:
+            return kvstore_value_create_int64(src->data.int_val);
+        case KVSTORE_TYPE_DOUBLE:
+            return kvstore_value_create_double(src->data.double_val);
+        case KVSTORE_TYPE_BOOL:
+            return kvstore_value_create_bool(src->data.bool_val);
+        case KVSTORE_TYPE_BINARY:
+            return kvstore_value_create_binary_arena(arena, src->data.binary_val.data,
+                                                     src->data.binary_val.len);
+        default:
+            return kvstore_value_create_null();
+    }
 }
 
 kvstore_value_t kvstore_value_copy(const kvstore_value_t* src) {
@@ -252,28 +438,20 @@ static kvstore_error_t resize_hash_table(kvstore_t* store, size_t new_bucket_cou
 }
 
 // Hash table entry management using arena allocator
-static kvstore_entry_t* create_entry(const char* key_data, uint32_t key_len, const kvstore_value_t* value,
-                                     uint32_t hash) {
-    kvstore_entry_t* entry = malloc(sizeof(kvstore_entry_t));
+static kvstore_entry_t* create_entry(arena_t* arena, const char* key_data, uint32_t key_len,
+                                     const kvstore_value_t* value, uint32_t hash) {
+    kvstore_entry_t* entry = arena_alloc(arena, sizeof(kvstore_entry_t));
     if (!entry) return NULL;
 
-    entry->key = kvstore_string_create(key_data, key_len);
-    if (!entry->key.data) {
-        free(entry);
+    entry->key = kvstore_string_create_arena(arena, key_data, key_len);
+    if (!entry->key.data && key_len > 0) {
         return NULL;
     }
 
-    entry->value = kvstore_value_copy(value);
+    entry->value = kvstore_value_copy_arena(arena, value);
     entry->hash  = hash;
     entry->next  = NULL;
     return entry;
-}
-
-static void destroy_entry(kvstore_entry_t* entry) {
-    if (!entry) return;
-    kvstore_string_destroy(&entry->key);
-    kvstore_value_destroy(&entry->value);
-    free(entry);
 }
 
 static kvstore_entry_t* find_entry(const kvstore_t* store, const char* key_data, uint32_t key_len,
@@ -309,15 +487,10 @@ kvstore_t* kvstore_create(size_t capacity) {
         return NULL;
     }
 
+    arena_init(&store->arena);
     store->bucket_count    = bucket_count;
     store->entry_count     = 0;
     store->max_load_factor = KVSTORE_DEFAULT_LOAD_FACTOR;
-    store->arena           = arena_create(64 * 1024);  // 64KB arena blocks
-    if (!store->arena) {
-        free(store->buckets);
-        free(store);
-        return NULL;
-    }
 
     return store;
 }
@@ -325,27 +498,20 @@ kvstore_t* kvstore_create(size_t capacity) {
 void kvstore_destroy(kvstore_t* store) {
     if (!store) return;
 
-    kvstore_clear(store);
+    arena_destroy(&store->arena);
     free(store->buckets);
-    arena_destroy(store->arena);
     free(store);
 }
 
 kvstore_error_t kvstore_clear(kvstore_t* store) {
     if (!store) return KVSTORE_ERROR_NULL_POINTER;
 
-    for (size_t i = 0; i < store->bucket_count; i++) {
-        kvstore_entry_t* entry = store->buckets[i];
-        while (entry) {
-            kvstore_entry_t* next = entry->next;
-            destroy_entry(entry);
-            entry = next;
-        }
-        store->buckets[i] = NULL;
-    }
+    // Clear the arena (this effectively frees all entries)
+    arena_clear(&store->arena);
 
+    // Clear bucket pointers
+    memset(store->buckets, 0, store->bucket_count * sizeof(kvstore_entry_t*));
     store->entry_count = 0;
-    arena_reset(store->arena);
     return KVSTORE_OK;
 }
 
@@ -372,8 +538,9 @@ kvstore_error_t kvstore_put_value(kvstore_t* store, const char* key_data, uint32
     kvstore_entry_t* existing = find_entry(store, key_data, key_len, hash);
 
     if (existing) {
-        kvstore_value_destroy(&existing->value);
-        existing->value = kvstore_value_copy(value);
+        // For updates, we need to replace the value but can't free the old one
+        // since it's in the arena. We'll just overwrite it.
+        existing->value = kvstore_value_copy_arena(&store->arena, value);
         return KVSTORE_OK;
     }
 
@@ -382,7 +549,7 @@ kvstore_error_t kvstore_put_value(kvstore_t* store, const char* key_data, uint32
         if (resize_result != KVSTORE_OK) return resize_result;
     }
 
-    kvstore_entry_t* new_entry = create_entry(key_data, key_len, value, hash);
+    kvstore_entry_t* new_entry = create_entry(&store->arena, key_data, key_len, value, hash);
     if (!new_entry) return KVSTORE_ERROR_MEMORY;
 
     size_t index          = hash % store->bucket_count;
@@ -427,7 +594,8 @@ kvstore_error_t kvstore_delete_key(kvstore_t* store, const char* key_data, uint3
             } else {
                 *head_ptr = entry->next;
             }
-            destroy_entry(entry);
+            // Note: We don't free the entry since it's in the arena
+            // The memory will be reclaimed when the arena is cleared/destroyed
             store->entry_count--;
             return KVSTORE_OK;
         }
@@ -475,8 +643,10 @@ kvstore_error_t kvstore_put_string(kvstore_t* store, const char* key, const char
     if (key_len > KVSTORE_MAX_STRING_SIZE || value_len > KVSTORE_MAX_STRING_SIZE) {
         return KVSTORE_ERROR_STRING_TOO_LARGE;
     }
-    kvstore_value_t val = kvstore_value_create_string(value, (uint32_t)value_len);
-    return kvstore_put_value(store, key, (uint32_t)key_len, &val);
+    kvstore_value_t val    = kvstore_value_create_string(value, (uint32_t)value_len);
+    kvstore_error_t result = kvstore_put_value(store, key, (uint32_t)key_len, &val);
+    kvstore_value_destroy(&val);
+    return result;
 }
 
 kvstore_error_t kvstore_put_string_len(kvstore_t* store, const char* key, const char* value, uint32_t len) {
@@ -485,8 +655,10 @@ kvstore_error_t kvstore_put_string_len(kvstore_t* store, const char* key, const 
     if (key_len > KVSTORE_MAX_STRING_SIZE || len > KVSTORE_MAX_STRING_SIZE) {
         return KVSTORE_ERROR_STRING_TOO_LARGE;
     }
-    kvstore_value_t val = kvstore_value_create_string(value, len);
-    return kvstore_put_value(store, key, (uint32_t)key_len, &val);
+    kvstore_value_t val    = kvstore_value_create_string(value, len);
+    kvstore_error_t result = kvstore_put_value(store, key, (uint32_t)key_len, &val);
+    kvstore_value_destroy(&val);
+    return result;
 }
 
 kvstore_error_t kvstore_put_int64(kvstore_t* store, const char* key, int64_t value) {
@@ -519,8 +691,10 @@ kvstore_error_t kvstore_put_binary(kvstore_t* store, const char* key, const void
     if (key_len > KVSTORE_MAX_STRING_SIZE || len > KVSTORE_MAX_STRING_SIZE) {
         return KVSTORE_ERROR_STRING_TOO_LARGE;
     }
-    kvstore_value_t val = kvstore_value_create_binary(data, len);
-    return kvstore_put_value(store, key, (uint32_t)key_len, &val);
+    kvstore_value_t val    = kvstore_value_create_binary(data, len);
+    kvstore_error_t result = kvstore_put_value(store, key, (uint32_t)key_len, &val);
+    kvstore_value_destroy(&val);
+    return result;
 }
 
 // Type-specific get operations
@@ -704,7 +878,6 @@ static kvstore_error_t read_value(int fd, kvstore_value_t* value) {
             }
 
             // Read the data directly into the allocated buffer
-            printf("[DEBUG] Reading string data into buffer at %p\n", (void*)buffer);
             if (read_full(fd, buffer, len) != (ssize_t)len) {
                 free(buffer);
                 return KVSTORE_ERROR_IO;
@@ -945,6 +1118,19 @@ const kvstore_entry_t* kvstore_iter_get(const kvstore_iterator_t* iter) {
     return iter && iter->current_entry ? iter->current_entry : NULL;
 }
 
+// Arena-specific utility functions
+static size_t kvstore_arena_total_allocated(const kvstore_t* store) {
+    return store ? store->arena.total_allocated : 0;
+}
+static size_t kvstore_arena_total_used(const kvstore_t* store) {
+    return store ? store->arena.total_used : 0;
+}
+
+static double kvstore_arena_utilization(const kvstore_t* store) {
+    if (!store || store->arena.total_allocated == 0) return 0.0;
+    return (double)store->arena.total_used / (double)store->arena.total_allocated;
+}
+
 // Utility functions
 const char* kvstore_error_string(kvstore_error_t error) {
     switch (error) {
@@ -1000,6 +1186,9 @@ void kvstore_print_stats(const kvstore_t* store) {
     printf("  Size: %zu\n", kvstore_size(store));
     printf("  Capacity: %zu\n", kvstore_capacity(store));
     printf("  Load Factor: %.2f\n", kvstore_load_factor(store));
+    printf("  Arena Total Allocated: %zu bytes\n", kvstore_arena_total_allocated(store));
+    printf("  Arena Total Used: %zu bytes\n", kvstore_arena_total_used(store));
+    printf("  Arena Utilization: %.2f%%\n", kvstore_arena_utilization(store) * 100.0);
 }
 
 void kvstore_print_all(const kvstore_t* store) {

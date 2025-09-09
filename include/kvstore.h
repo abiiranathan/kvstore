@@ -4,6 +4,7 @@
 #include <stdbool.h>
 #include <stddef.h>
 #include <stdint.h>
+#include <stdio.h>
 
 #ifdef __cplusplus
 extern "C" {
@@ -73,20 +74,6 @@ typedef struct kvstore_entry {
     struct kvstore_entry* next;
     uint32_t hash;
 } kvstore_entry_t;
-
-// Arena allocator
-typedef struct arena_block {
-    struct arena_block* next;
-    size_t used;
-    size_t size;
-    char data[];
-} arena_block_t;
-
-typedef struct {
-    arena_block_t* first;
-    arena_block_t* current;
-    size_t block_size;
-} arena_t;
 
 // Core API - Store management
 kvstore_t* kvstore_create(size_t capacity);
@@ -166,12 +153,6 @@ kvstore_string_t kvstore_string_from_cstr(const char* cstr);
 void kvstore_string_destroy(kvstore_string_t* str);
 bool kvstore_string_equals(const kvstore_string_t* a, const kvstore_string_t* b);
 kvstore_string_t kvstore_string_copy(const kvstore_string_t* src);
-
-// Arena allocator functions
-arena_t* arena_create(size_t block_size);
-void arena_destroy(arena_t* arena);
-void* arena_alloc(arena_t* arena, size_t size);
-void arena_reset(arena_t* arena);
 
 #ifdef __cplusplus
 }

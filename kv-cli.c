@@ -1,4 +1,4 @@
-#include <stdio.h>
+#include <stdio.h>  // Before readline include for FILE* symbol.
 
 #include <errno.h>
 #include <getopt.h>
@@ -8,45 +8,33 @@
 #include <readline/readline.h>
 #include <signal.h>
 #include <stdarg.h>
-#include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 #include <sys/resource.h>
 #include <sys/time.h>
 #include <time.h>
 
-#include "kvstore.h"
-
-#include "alloc.h"
+#include "include/common.h"
+#include "include/kvapi.h"
 
 #define DEFAULT_DB_FILE   "kvstore.db"
 #define MAX_COMMAND_LEN   4096
 #define MAX_CONFIG_LINE   256
 #define HISTORY_FILE_SIZE 1000
 
-// Configuration structure
-typedef struct {
-    size_t capacity;
-    const char* db_file;
-    bool auto_save;
-    int auto_save_interval;
-} config_t;
-
 // Global state
-static kvstore_t* g_store = NULL;
-static config_t g_config  = {
-     .capacity           = KVSTORE_DEFAULT_CAPACITY,
-     .db_file            = DEFAULT_DB_FILE,
-     .auto_save          = true,
-     .auto_save_interval = 60,
+static kvapi_handle_t* g_api = NULL;  // The KV API handle.
+
+// CLI configuration.
+static kvapi_config_t g_config = {
+    .capacity           = KVSTORE_DEFAULT_CAPACITY,
+    .db_file            = DEFAULT_DB_FILE,
+    .auto_save          = true,
+    .auto_save_interval = 60,
 };
 
 static bool g_running                         = true;
-static pthread_mutex_t store_mutex            = PTHREAD_MUTEX_INITIALIZER;
 static volatile sig_atomic_t g_immediate_exit = 0;
-
-// Logging levels
-typedef enum { LOG_DEBUG, LOG_INFO, LOG_WARNING, LOG_ERROR } log_level_t;
 
 // Command structure
 typedef struct {
@@ -70,13 +58,16 @@ static int cmd_load(int argc, char** argv);
 static int cmd_backup(int argc, char** argv);
 static int cmd_config(int argc, char** argv);
 static int cmd_quit(int argc, char** argv);
+static int cmd_type(int argc, char** argv);
+static int cmd_set_int(int argc, char** argv);
+static int cmd_get_int(int argc, char** argv);
+static int cmd_set_double(int argc, char** argv);
+static int cmd_get_double(int argc, char** argv);
+static int cmd_set_bool(int argc, char** argv);
+static int cmd_get_bool(int argc, char** argv);
+static int cmd_set_null(int argc, char** argv);
 
-// Utility function declarations
-static void logger(log_level_t level, const char* format, ...);
-static void print_error(const char* cmd, kvstore_error_t error, const char* details);
-static bool validate_key(const char* key);
-static bool validate_value_len(size_t value_len);
-static char** split_args(char* line, int* argc);
+// Utility function declarations;
 static void setup_signals(void);
 static void setup_readline(void);
 static void save_history(void);
@@ -86,8 +77,16 @@ static void cleanup(void);
 // Command table
 static const command_t commands[] = {
     {"help", "help [command]", "Show help for commands", cmd_help},
-    {"set", "set <key> <value>", "Set key to value", cmd_set},
-    {"get", "get <key>", "Get value for key", cmd_get},
+    {"set", "set <key> <value>", "Set key to string value", cmd_set},
+    {"set-int", "set-int <key> <int_value>", "Set key to int64 value", cmd_set_int},
+    {"set-double", "set-double <key> <double_value>", "Set key to double value", cmd_set_double},
+    {"set-bool", "set-bool <key> <true|false|1|0>", "Set key to bool value", cmd_set_bool},
+    {"set-null", "set-null <key>", "Set key to null value", cmd_set_null},
+    {"get", "get <key>", "Get value for key (auto-detect type)", cmd_get},
+    {"get-int", "get-int <key>", "Get int64 value for key", cmd_get_int},
+    {"get-double", "get-double <key>", "Get double value for key", cmd_get_double},
+    {"get-bool", "get-bool <key>", "Get bool value for key", cmd_get_bool},
+    {"type", "type <key>", "Get type of key", cmd_type},
     {"del", "del <key>", "Delete key", cmd_del},
     {"exists", "exists <key>", "Check if key exists", cmd_exists},
     {"keys", "keys", "List all keys", cmd_keys},
@@ -102,110 +101,12 @@ static const command_t commands[] = {
     {NULL, NULL, NULL, NULL},
 };
 
-// Thread-safe store access macros
-#define LOCK_STORE()                                                                                         \
-    do {                                                                                                     \
-        if (pthread_mutex_lock(&store_mutex) != 0) {                                                         \
-            logger(LOG_ERROR, "Failed to lock store mutex");                                                 \
-        }                                                                                                    \
-    } while (0)
-
-#define UNLOCK_STORE()                                                                                       \
-    do {                                                                                                     \
-        if (pthread_mutex_unlock(&store_mutex) != 0) {                                                       \
-            logger(LOG_ERROR, "Failed to unlock store mutex");                                               \
-        }                                                                                                    \
-    } while (0)
-
-// Logging implementation
-static void logger(log_level_t level, const char* format, ...) {
-    va_list args;
-    va_start(args, format);
-
-    const char* level_str;
-    FILE* output;
-
-    switch (level) {
-        case LOG_DEBUG:
-            level_str = "DEBUG";
-            output    = stdout;
-            break;
-        case LOG_INFO:
-            level_str = "INFO";
-            output    = stdout;
-            break;
-        case LOG_WARNING:
-            level_str = "WARN";
-            output    = stderr;
-            break;
-        case LOG_ERROR:
-            level_str = "ERROR";
-            output    = stderr;
-            break;
-        default:
-            level_str = "INFO";
-            output    = stdout;
-            break;
-    }
-
-    time_t now   = time(NULL);
-    struct tm* t = localtime(&now);
-
-    fprintf(output, "[%04d-%02d-%02d %02d:%02d:%02d] [%s] ", t->tm_year + 1900, t->tm_mon + 1, t->tm_mday,
-            t->tm_hour, t->tm_min, t->tm_sec, level_str);
-
-    vfprintf(output, format, args);
-    fprintf(output, "\n");
-
-    va_end(args);
-
-    // Flush stderr for immediate error visibility
-    if (output == stderr) {
-        fflush(stderr);
-    }
-}
-
-// Enhanced error printing
-static void print_error(const char* cmd, kvstore_error_t error, const char* details) {
-    if (details) {
-        logger(LOG_ERROR, "Command %s failed: %s (%s)", cmd, kvstore_error_string(error), details);
-    } else {
-        logger(LOG_ERROR, "Command %s failed: %s", cmd, kvstore_error_string(error));
-    }
-}
-
-// Input validation
-static bool validate_key(const char* key) {
-    if (!key || strlen(key) == 0) {
-        logger(LOG_DEBUG, "Key validation failed: null or empty key");
-        return false;
-    }
-
-    if (strlen(key) > KVSTORE_MAX_STRING_SIZE) {
-        logger(LOG_DEBUG, "Key validation failed: key too long (%zu > %u)", strlen(key),
-               KVSTORE_MAX_STRING_SIZE);
-        return false;
-    }
-
-    // Add any other key restrictions here
-    return true;
-}
-
-static bool validate_value_len(size_t value_len) {
-    if (value_len > KVSTORE_MAX_STRING_SIZE) {
-        logger(LOG_DEBUG, "Value validation failed: value too long (%zu > %u)", value_len,
-               KVSTORE_MAX_STRING_SIZE);
-        return false;
-    }
-    return true;
-}
-
 // Signal handler for graceful shutdown
 static void signal_handler(int sig) {
     if (sig == SIGINT || sig == SIGTERM) {
         // First signal - try graceful shutdown
         if (!g_immediate_exit) {
-            logger(LOG_INFO, "Received signal %d, initiating graceful shutdown", sig);
+            kv_log(LOG_INFO, "Received signal %d, initiating graceful shutdown", sig);
             g_running        = false;
             g_immediate_exit = 1;
 
@@ -213,82 +114,10 @@ static void signal_handler(int sig) {
             rl_done = 1;  // Tell readline to return immediately
         } else {
             // Second signal - force immediate exit
-            logger(LOG_INFO, "Received second signal %d, forcing immediate exit", sig);
+            kv_log(LOG_INFO, "Received second signal %d, forcing immediate exit", sig);
             _exit(1);
         }
     }
-}
-
-// Argument splitting with bounds checking
-static char** split_args(char* line, int* argc) {
-    static char* args[64];
-    *argc = 0;
-
-    if (!line || strlen(line) == 0) {
-        return args;
-    }
-
-    char* ptr       = line;
-    bool in_quote   = false;
-    bool in_token   = false;
-    char quote_char = '\0';
-
-    while (*ptr && *argc < 63) {
-        // Skip leading whitespace
-        while (*ptr == ' ' || *ptr == '\t') {
-            ptr++;
-        }
-
-        if (!*ptr) break;
-
-        // Handle quoted strings
-        if (*ptr == '"' || *ptr == '\'') {
-            in_quote   = true;
-            quote_char = *ptr;
-            ptr++;  // Skip the opening quote
-            args[(*argc)++] = ptr;
-            in_token        = true;
-        } else {
-            args[(*argc)++] = ptr;
-            in_token        = true;
-        }
-
-        // Find the end of this argument
-        while (*ptr && (in_quote || (*ptr != ' ' && *ptr != '\t'))) {
-            if (in_quote) {
-                if (*ptr == quote_char) {
-                    // Found closing quote
-                    *ptr = '\0';  // Terminate the token
-                    ptr++;
-                    in_quote = false;
-                    break;
-                }
-                if (*ptr == '\\' && *(ptr + 1) == quote_char) {
-                    // Escaped quote, remove the backslash
-                    memmove(ptr, ptr + 1, strlen(ptr));
-                }
-            }
-            ptr++;
-        }
-
-        if (in_token) {
-            // Terminate the current token
-            if (*ptr) {
-                *ptr = '\0';
-                ptr++;
-            }
-            in_token = false;
-        }
-
-        // Handle unclosed quotes
-        if (in_quote) {
-            // If we reach end of line with unclosed quote, just accept it
-            in_quote = false;
-        }
-    }
-
-    args[*argc] = NULL;
-    return args;
 }
 
 // Command implementations
@@ -296,7 +125,7 @@ static int cmd_help(int argc, char** argv) {
     if (argc == 1) {
         printf("Available commands:\n");
         for (const command_t* cmd = commands; cmd->name; cmd++) {
-            printf("  %-20s %s\n", cmd->usage, cmd->description);
+            printf("  %-30s %s\n", cmd->usage, cmd->description);
         }
         printf("\nUse 'help <command>' for specific command help.\n");
         return 0;
@@ -322,8 +151,8 @@ static int cmd_set(int argc, char** argv) {
         return 1;
     }
 
-    if (!validate_key(argv[1])) {
-        print_error("set", KVSTORE_ERROR_INVALID_KEY, "Invalid key format or length");
+    if (!kv_validate_key(argv[1])) {
+        kv_print_error("set", KVSTORE_ERROR_INVALID_KEY, "Invalid key format or length");
         return 1;
     }
 
@@ -334,50 +163,181 @@ static int cmd_set(int argc, char** argv) {
         if (i < argc - 1) value_len++;  // Space between args
     }
 
-    if (!validate_value_len(value_len)) {
-        print_error("set", KVSTORE_ERROR_STRING_TOO_LARGE, "Value too long");
+    if (!kv_validate_value_len(value_len)) {
+        kv_print_error("set", KVSTORE_ERROR_STRING_TOO_LARGE, "Value too long");
         return 1;
     }
 
     // If there's only one value argument, use it directly
     if (argc == 3) {
-        LOCK_STORE();
-        kvstore_error_t error = kvstore_put_str(g_store, argv[1], argv[2]);
-        UNLOCK_STORE();
-
+        kvstore_error_t error = kvapi_set_string(g_api, argv[1], argv[2]);
         if (error != KVSTORE_OK) {
-            print_error("set", error, NULL);
+            kv_print_error("set", error, NULL);
             return 1;
         }
     } else {
         // Multiple arguments, concatenate them
-        char* value = MALLOC(value_len + 1);
+        char* value = malloc(value_len + 1);
         if (!value) {
-            print_error("set", KVSTORE_ERROR_MEMORY, "Value allocation failed");
+            kv_print_error("set", KVSTORE_ERROR_MEMORY, "Value allocation failed");
             return 1;
         }
 
         value[0] = '\0';
         for (int i = 2; i < argc; i++) {
             if (i > 2) {
-                strncat(value, " ", value_len - strlen(value));
+                strcat(value, " ");
             }
-            strncat(value, argv[i], value_len - strlen(value));
+            strcat(value, argv[i]);
         }
 
-        LOCK_STORE();
-        kvstore_error_t error = kvstore_put_str(g_store, argv[1], value);
-        UNLOCK_STORE();
-
-        FREE(value);
+        kvstore_error_t error = kvapi_set_string(g_api, argv[1], value);
+        free(value);
 
         if (error != KVSTORE_OK) {
-            print_error("set", error, NULL);
+            kv_print_error("set", error, NULL);
             return 1;
         }
     }
 
     printf("OK\n");
+    return 0;
+}
+
+static int cmd_set_int(int argc, char** argv) {
+    if (argc != 3) {
+        printf("Usage: set-int <key> <int_value>\n");
+        return 1;
+    }
+
+    if (!kv_validate_key(argv[1])) {
+        kv_print_error("set-int", KVSTORE_ERROR_INVALID_KEY, "Invalid key format or length");
+        return 1;
+    }
+
+    char* endptr;
+    errno         = 0;
+    int64_t value = strtoll(argv[2], &endptr, 10);
+    if (errno != 0 || *endptr != '\0') {
+        kv_print_error("set-int", KVSTORE_ERROR_INVALID_TYPE, "Invalid integer value");
+        return 1;
+    }
+
+    kvstore_error_t error = kvapi_set_int64(g_api, argv[1], value);
+
+    if (error != KVSTORE_OK) {
+        kv_print_error("set-int", error, NULL);
+        return 1;
+    }
+
+    printf("OK\n");
+    return 0;
+}
+
+static int cmd_set_double(int argc, char** argv) {
+    if (argc != 3) {
+        printf("Usage: set-double <key> <double_value>\n");
+        return 1;
+    }
+
+    if (!kv_validate_key(argv[1])) {
+        kv_print_error("set-double", KVSTORE_ERROR_INVALID_KEY, "Invalid key format or length");
+        return 1;
+    }
+
+    char* endptr;
+    errno        = 0;
+    double value = strtod(argv[2], &endptr);
+    if (errno != 0 || *endptr != '\0') {
+        kv_print_error("set-double", KVSTORE_ERROR_INVALID_TYPE, "Invalid double value");
+        return 1;
+    }
+
+    kvstore_error_t error = kvapi_set_double(g_api, argv[1], value);
+
+    if (error != KVSTORE_OK) {
+        kv_print_error("set-double", error, NULL);
+        return 1;
+    }
+
+    printf("OK\n");
+    return 0;
+}
+
+static int cmd_set_bool(int argc, char** argv) {
+    if (argc != 3) {
+        printf("Usage: set-bool <key> <true|false|1|0>\n");
+        return 1;
+    }
+
+    if (!kv_validate_key(argv[1])) {
+        kv_print_error("set-bool", KVSTORE_ERROR_INVALID_KEY, "Invalid key format or length");
+        return 1;
+    }
+
+    bool value;
+    if (!kv_parse_bool(argv[2], &value)) {
+        kv_print_error("set-bool", KVSTORE_ERROR_INVALID_TYPE, "Invalid boolean value (use true/false/1/0)");
+        return 1;
+    }
+
+    kvstore_error_t error = kvapi_set_bool(g_api, argv[1], value);
+
+    if (error != KVSTORE_OK) {
+        kv_print_error("set-bool", error, NULL);
+        return 1;
+    }
+
+    printf("OK\n");
+    return 0;
+}
+
+static int cmd_set_null(int argc, char** argv) {
+    if (argc != 2) {
+        printf("Usage: set-null <key>\n");
+        return 1;
+    }
+
+    if (!kv_validate_key(argv[1])) {
+        kv_print_error("set-null", KVSTORE_ERROR_INVALID_KEY, "Invalid key format or length");
+        return 1;
+    }
+
+    kvstore_error_t error = kvapi_set_null(g_api, argv[1]);
+
+    if (error != KVSTORE_OK) {
+        kv_print_error("set-null", error, NULL);
+        return 1;
+    }
+
+    printf("OK\n");
+    return 0;
+}
+
+static int cmd_type(int argc, char** argv) {
+    if (argc != 2) {
+        printf("Usage: type <key>\n");
+        return 1;
+    }
+
+    if (!kv_validate_key(argv[1])) {
+        kv_print_error("type", KVSTORE_ERROR_INVALID_KEY, "Invalid key format");
+        return 1;
+    }
+
+    kvstore_type_t type;
+
+    kvstore_error_t error = kvapi_get_type(g_api, argv[1], &type);
+
+    if (error == KVSTORE_ERROR_KEY_NOT_FOUND) {
+        printf("(unknown)\n");
+        return 0;
+    } else if (error != KVSTORE_OK) {
+        kv_print_error("type", error, NULL);
+        return 1;
+    }
+
+    printf("%s\n", kvstore_type_string(type));
     return 0;
 }
 
@@ -387,25 +347,128 @@ static int cmd_get(int argc, char** argv) {
         return 1;
     }
 
-    if (!validate_key(argv[1])) {
-        print_error("get", KVSTORE_ERROR_INVALID_KEY, "Invalid key format");
+    if (!kv_validate_key(argv[1])) {
+        kv_print_error("get", KVSTORE_ERROR_INVALID_KEY, "Invalid key format");
         return 1;
     }
 
-    const kvstore_string_t* value;
-    LOCK_STORE();
-    kvstore_error_t error = kvstore_get_str(g_store, argv[1], &value);
-    UNLOCK_STORE();
+    kvapi_result_t result;
+
+    kvstore_error_t error = kvapi_get(g_api, argv[1], &result);
 
     if (error == KVSTORE_ERROR_KEY_NOT_FOUND) {
         printf("(nil)\n");
         return 0;
     } else if (error != KVSTORE_OK) {
-        print_error("get", error, NULL);
+        kv_print_error("get", error, NULL);
         return 1;
     }
 
-    printf("\"%.*s\"\n", (int)value->len, value->data);
+    switch (result.type) {
+        case KVSTORE_TYPE_NULL:
+            printf("null\n");
+            break;
+        case KVSTORE_TYPE_STRING:
+            printf("\"%s\"\n", result.value.str_val ? result.value.str_val : "");
+            break;
+        case KVSTORE_TYPE_INT64:
+            printf("(integer) %ld\n", result.value.int_val);
+            break;
+        case KVSTORE_TYPE_DOUBLE:
+            printf("(double) %g\n", result.value.double_val);
+            break;
+        case KVSTORE_TYPE_BOOL:
+            printf("(boolean) %s\n", result.value.bool_val ? "true" : "false");
+            break;
+        case KVSTORE_TYPE_BINARY:
+            printf("(binary) %u bytes\n", result.value.binary_val.len);
+            break;
+        default:
+            printf("(unknown)\n");
+    }
+
+    kvapi_free_result(&result);
+    return 0;
+}
+
+static int cmd_get_int(int argc, char** argv) {
+    if (argc != 2) {
+        printf("Usage: get-int <key>\n");
+        return 1;
+    }
+
+    if (!kv_validate_key(argv[1])) {
+        kv_print_error("get-int", KVSTORE_ERROR_INVALID_KEY, "Invalid key format");
+        return 1;
+    }
+
+    int64_t value;
+
+    kvstore_error_t error = kvapi_get_int64(g_api, argv[1], &value);
+
+    if (error == KVSTORE_ERROR_KEY_NOT_FOUND) {
+        printf("(nil)\n");
+        return 0;
+    } else if (error != KVSTORE_OK) {
+        kv_print_error("get-int", error, NULL);
+        return 1;
+    }
+
+    printf("(integer) %ld\n", value);
+    return 0;
+}
+
+static int cmd_get_double(int argc, char** argv) {
+    if (argc != 2) {
+        printf("Usage: get-double <key>\n");
+        return 1;
+    }
+
+    if (!kv_validate_key(argv[1])) {
+        kv_print_error("get-double", KVSTORE_ERROR_INVALID_KEY, "Invalid key format");
+        return 1;
+    }
+
+    double value;
+
+    kvstore_error_t error = kvapi_get_double(g_api, argv[1], &value);
+
+    if (error == KVSTORE_ERROR_KEY_NOT_FOUND) {
+        printf("(nil)\n");
+        return 0;
+    } else if (error != KVSTORE_OK) {
+        kv_print_error("get-double", error, NULL);
+        return 1;
+    }
+
+    printf("(double) %g\n", value);
+    return 0;
+}
+
+static int cmd_get_bool(int argc, char** argv) {
+    if (argc != 2) {
+        printf("Usage: get-bool <key>\n");
+        return 1;
+    }
+
+    if (!kv_validate_key(argv[1])) {
+        kv_print_error("get-bool", KVSTORE_ERROR_INVALID_KEY, "Invalid key format");
+        return 1;
+    }
+
+    bool value;
+
+    kvstore_error_t error = kvapi_get_bool(g_api, argv[1], &value);
+
+    if (error == KVSTORE_ERROR_KEY_NOT_FOUND) {
+        printf("(nil)\n");
+        return 0;
+    } else if (error != KVSTORE_OK) {
+        kv_print_error("get-bool", error, NULL);
+        return 1;
+    }
+
+    printf("(boolean) %s\n", value ? "true" : "false");
     return 0;
 }
 
@@ -415,24 +478,24 @@ static int cmd_del(int argc, char** argv) {
         return 1;
     }
 
-    if (!validate_key(argv[1])) {
-        print_error("del", KVSTORE_ERROR_INVALID_KEY, "Invalid key format");
+    if (!kv_validate_key(argv[1])) {
+        kv_print_error("del", KVSTORE_ERROR_INVALID_KEY, "Invalid key format");
         return 1;
     }
 
-    LOCK_STORE();
-    kvstore_error_t error = kvstore_delete_str(g_store, argv[1]);
-    UNLOCK_STORE();
+    bool deleted;
+
+    kvstore_error_t error = kvapi_delete(g_api, argv[1], &deleted);
 
     if (error == KVSTORE_ERROR_KEY_NOT_FOUND) {
         printf("(integer) 0\n");
         return 0;
     } else if (error != KVSTORE_OK) {
-        print_error("del", error, NULL);
+        kv_print_error("del", error, NULL);
         return 1;
     }
 
-    printf("(integer) 1\n");
+    printf("(integer) %d\n", deleted ? 1 : 0);
     return 0;
 }
 
@@ -442,14 +505,12 @@ static int cmd_exists(int argc, char** argv) {
         return 1;
     }
 
-    if (!validate_key(argv[1])) {
-        print_error("exists", KVSTORE_ERROR_INVALID_KEY, "Invalid key format");
+    if (!kv_validate_key(argv[1])) {
+        kv_print_error("exists", KVSTORE_ERROR_INVALID_KEY, "Invalid key format");
         return 1;
     }
 
-    LOCK_STORE();
-    bool exists = kvstore_exists_str(g_store, argv[1]);
-    UNLOCK_STORE();
+    bool exists = kvapi_exists(g_api, argv[1]);
 
     printf("(integer) %d\n", exists ? 1 : 0);
     return 0;
@@ -459,26 +520,23 @@ static int cmd_keys(int argc, char** argv) {
     (void)argc;
     (void)argv;
 
-    LOCK_STORE();
-    size_t count = kvstore_size(g_store);
+    kvstore_t* store = kvapi_store(g_api);
+    size_t count     = kvstore_size(store);
     if (count == 0) {
-        UNLOCK_STORE();
         printf("(empty list or set)\n");
         return 0;
     }
-
     printf("%zu keys found:\n", count);
 
-    kvstore_iterator_t iter = kvstore_iter_begin(g_store);
+    kvstore_iterator_t iter = kvstore_iter_begin(store);
     size_t i                = 1;
 
     while (kvstore_iter_valid(&iter)) {
         const kvstore_entry_t* entry = kvstore_iter_get(&iter);
-        printf("  %zu) \"%.*s\"\n", i++, (int)entry->key.len, entry->key.data);
+        printf("  %zu) \"%.*s\" (%s)\n", i++, (int)entry->key.len, entry->key.data,
+               kvstore_type_string(entry->value.type));
         kvstore_iter_next(&iter);
     }
-    UNLOCK_STORE();
-
     return 0;
 }
 
@@ -486,12 +544,10 @@ static int cmd_clear(int argc, char** argv) {
     (void)argc;
     (void)argv;
 
-    LOCK_STORE();
-    kvstore_error_t error = kvstore_clear(g_store);
-    UNLOCK_STORE();
+    kvstore_error_t error = kvapi_clear(g_api);
 
     if (error != KVSTORE_OK) {
-        print_error("clear", error, NULL);
+        kv_print_error("clear", error, NULL);
         return 1;
     }
 
@@ -503,21 +559,17 @@ static int cmd_stats(int argc, char** argv) {
     (void)argc;
     (void)argv;
 
-    LOCK_STORE();
-    kvstore_print_stats(g_store);
-    UNLOCK_STORE();
+    kvapi_stats(g_api, stdout);
     return 0;
 }
 
 static int cmd_save(int argc, char** argv) {
     const char* filename = (argc > 1) ? argv[1] : g_config.db_file;
 
-    LOCK_STORE();
-    kvstore_error_t error = kvstore_save(g_store, filename);
-    UNLOCK_STORE();
+    kvstore_error_t error = kvapi_save(g_api, filename);
 
     if (error != KVSTORE_OK) {
-        print_error("save", error, filename);
+        kv_print_error("save", error, filename);
         return 1;
     }
 
@@ -528,12 +580,10 @@ static int cmd_save(int argc, char** argv) {
 static int cmd_load(int argc, char** argv) {
     const char* filename = (argc > 1) ? argv[1] : g_config.db_file;
 
-    LOCK_STORE();
-    kvstore_error_t error = kvstore_load(g_store, filename);
-    UNLOCK_STORE();
+    kvstore_error_t error = kvapi_load(g_api, filename);
 
     if (error != KVSTORE_OK) {
-        print_error("load", error, filename);
+        kv_print_error("load", error, filename);
         return 1;
     }
 
@@ -543,27 +593,20 @@ static int cmd_load(int argc, char** argv) {
 
 static int cmd_backup(int argc, char** argv) {
     const char* backup_file = (argc > 1) ? argv[1] : NULL;
-    char default_backup[256];
-    time_t now   = time(NULL);
-    struct tm* t = localtime(&now);
 
-    if (!backup_file) {
-        snprintf(default_backup, sizeof(default_backup), "%s.backup.%04d%02d%02d-%02d%02d%02d",
-                 g_config.db_file, t->tm_year + 1900, t->tm_mon + 1, t->tm_mday, t->tm_hour, t->tm_min,
-                 t->tm_sec);
-        backup_file = default_backup;
-    }
-
-    LOCK_STORE();
-    kvstore_error_t error = kvstore_save(g_store, backup_file);
-    UNLOCK_STORE();
+    kvstore_error_t error = kvapi_backup(g_api, backup_file);
 
     if (error != KVSTORE_OK) {
-        print_error("backup", error, backup_file);
+        kv_print_error("backup", error, backup_file ? backup_file : "default");
         return 1;
     }
 
-    printf("Backup created: %s\n", backup_file);
+    if (!backup_file) {
+        // Print generated filename - extend API to return it if needed
+        printf("Backup created: %s.backup.timestamp (extend API for exact name)\n", g_config.db_file);
+    } else {
+        printf("Backup created: %s\n", backup_file);
+    }
     return 0;
 }
 
@@ -598,14 +641,10 @@ static int cmd_config(int argc, char** argv) {
             return 1;
         }
         size_t new_capacity = (size_t)new_capacity_long;
-        if (new_capacity < kvstore_size(g_store)) {
-            printf("Error: new capacity (%zu) cannot be less than current size (%zu)\n", new_capacity,
-                   kvstore_size(g_store));
-            return 1;
-        }
+        // Note: Resizing at runtime not supported in current API; log only
         g_config.capacity = new_capacity;
         config_changed    = true;
-        printf("Capacity set to %zu\n", g_config.capacity);
+        printf("Capacity set to %zu (note: requires restart for effect)\n", g_config.capacity);
 
     } else if (strcmp(key, "db_file") == 0) {
         printf("Error: db_file cannot be changed at runtime. Restart with -f option.\n");
@@ -641,13 +680,12 @@ static int cmd_config(int argc, char** argv) {
 
     } else {
         printf("Error: unknown configuration key '%s'\n", key);
-        printf(
-            "Available keys: capacity, auto_save, auto_save_interval, enable_monitoring, monitor_interval\n");
+        printf("Available keys: capacity, auto_save, auto_save_interval\n");
         return 1;
     }
 
     if (config_changed) {
-        logger(LOG_INFO, "Configuration changed: %s = %s", key, value);
+        kv_log(LOG_INFO, "Configuration changed: %s = %s", key, value);
     }
 
     return 0;
@@ -667,7 +705,7 @@ static int execute_command(char* line) {
     if (!line || strlen(line) == 0) return 0;
 
     int argc;
-    char** argv = split_args(line, &argc);
+    char** argv = kv_split_args(line, &argc);
 
     if (argc == 0) return 0;
 
@@ -691,21 +729,21 @@ static void setup_signals(void) {
     sigemptyset(&sa.sa_mask);
     sa.sa_flags = SA_RESTART;
     if (sigaction(SIGINT, &sa, NULL) != 0) {
-        logger(LOG_ERROR, "Failed to set up SIGINT handler");
+        kv_log(LOG_ERROR, "Failed to set up SIGINT handler");
     }
 
     // SIGTERM handler
     if (sigaction(SIGTERM, &sa, NULL) != 0) {
-        logger(LOG_ERROR, "Failed to set up SIGTERM handler");
+        kv_log(LOG_ERROR, "Failed to set up SIGTERM handler");
     }
 
     // Ignore SIGPIPE
     sa.sa_handler = SIG_IGN;
     if (sigaction(SIGPIPE, &sa, NULL) != 0) {
-        logger(LOG_ERROR, "Failed to set up SIGPIPE handler");
+        kv_log(LOG_ERROR, "Failed to set up SIGPIPE handler");
     }
 
-    logger(LOG_DEBUG, "Signal handlers set up");
+    kv_log(LOG_DEBUG, "Signal handlers set up");
 }
 
 static void setup_readline(void) {
@@ -717,10 +755,10 @@ static void setup_readline(void) {
         using_history();
         read_history(history_file);
         stifle_history(HISTORY_FILE_SIZE);
-        logger(LOG_DEBUG, "Readline history loaded from %s", history_file);
+        kv_log(LOG_DEBUG, "Readline history loaded from %s", history_file);
     }
 
-    logger(LOG_DEBUG, "Readline setup completed");
+    kv_log(LOG_DEBUG, "Readline setup completed");
 }
 
 static void save_history(void) {
@@ -729,97 +767,29 @@ static void save_history(void) {
         char history_file[256];
         snprintf(history_file, sizeof(history_file), "%s/.kvstore_history", home);
         write_history(history_file);
-        logger(LOG_DEBUG, "Readline history saved to %s", history_file);
+        kv_log(LOG_DEBUG, "Readline history saved to %s", history_file);
     }
 }
 
 static int load_config(const char* config_file) {
     FILE* file = fopen(config_file, "r");
     if (!file) {
-        logger(LOG_DEBUG, "Config file %s not found, using defaults", config_file);
+        kv_log(LOG_DEBUG, "Config file %s not found, using defaults", config_file);
         return 0;
     }
-
-    char line[MAX_CONFIG_LINE];
-    int line_num = 0;
-
-    while (fgets(line, sizeof(line), file)) {
-        line_num++;
-
-        // Remove trailing newline and comments
-        char* comment = strchr(line, '#');
-        if (comment) *comment = '\0';
-
-        size_t len = strlen(line);
-        if (len > 0 && line[len - 1] == '\n') {
-            line[len - 1] = '\0';
-        }
-
-        // Skip empty lines
-        if (strlen(line) == 0) continue;
-
-        // Parse config lines
-        if (strncmp(line, "capacity=", 9) == 0) {
-            g_config.capacity = (size_t)atoi(line + 9);
-        } else if (strncmp(line, "db_file=", 8) == 0) {
-            // For string values, we'd need to allocate memory
-            // For simplicity, we'll just log it for now
-            logger(LOG_INFO, "Config db_file setting ignored (runtime only)");
-        } else if (strncmp(line, "auto_save=", 10) == 0) {
-            g_config.auto_save = (strcmp(line + 10, "true") == 0);
-        } else if (strncmp(line, "auto_save_interval=", 19) == 0) {
-            g_config.auto_save_interval = atoi(line + 19);
-        } else {
-            logger(LOG_WARNING, "Unknown config option on line %d: %s", line_num, line);
-        }
-    }
-
-    fclose(file);
-    logger(LOG_INFO, "Configuration loaded from %s", config_file);
-    return 0;
+    return kv_load_config(config_file, &g_config);
 }
 
 static void cleanup(void) {
-    logger(LOG_INFO, "Cleaning up resources");
-
     // Save history
     save_history();
-
-    // Auto-save if enabled
-    if (g_config.auto_save && g_store) {
-        LOCK_STORE();
-        size_t store_size = kvstore_size(g_store);
-        if (store_size > 0) {
-            logger(LOG_INFO, "Auto-saving %zu key-value pairs", store_size);
-            kvstore_error_t error = kvstore_save(g_store, g_config.db_file);
-            if (error != KVSTORE_OK) {
-                logger(LOG_ERROR, "Failed to auto-save: %s", kvstore_error_string(error));
-            } else {
-                logger(LOG_INFO, "Auto-save completed successfully");
-            }
-        }
-        UNLOCK_STORE();
-    }
-
-    // Destroy store
-    if (g_store) {
-        logger(LOG_DEBUG, "Destroying key-value store");
-        kvstore_destroy(g_store);
-        g_store = NULL;
-    }
-
-    // Cleanup mutex
-    if (pthread_mutex_destroy(&store_mutex) != 0) {
-        logger(LOG_ERROR, "Failed to destroy store mutex");
-    }
-
-    logger(LOG_INFO, "Cleanup completed");
-    PRINT_ALLOC_STATS();
+    kv_cleanup(&g_config, g_api);
 }
 
 // Interactive REPL
 static void repl(void) {
-    printf("KV Store CLI v%d.%d.%d\n", KVSTORE_VERSION_MAJOR, KVSTORE_VERSION_MINOR, KVSTORE_VERSION_PATCH);
+    printf("KV Store CLI v%d.%d.%d (using KVAPI)\n", KVSTORE_VERSION_MAJOR, KVSTORE_VERSION_MINOR,
+           KVSTORE_VERSION_PATCH);
     printf("Type 'help' for available commands.\n\n");
 
     while (g_running) {
@@ -843,7 +813,7 @@ static void repl(void) {
 static int execute_batch(const char* filename) {
     FILE* file = strcmp(filename, "-") == 0 ? stdin : fopen(filename, "r");
     if (!file) {
-        logger(LOG_ERROR, "Failed to open batch file: %s", filename);
+        kv_log(LOG_ERROR, "Failed to open batch file: %s", filename);
         return 1;
     }
 
@@ -868,7 +838,7 @@ static int execute_batch(const char* filename) {
         printf("kv> %s\n", line);
         int result = execute_command(line);
         if (result != 0) {
-            logger(LOG_ERROR, "Error on line %d", line_num);
+            kv_log(LOG_ERROR, "Error on line %d", line_num);
             exit_code = result;
             if (file != stdin) {
                 // Stop on first error in batch files (but not stdin)
@@ -894,11 +864,11 @@ static void print_usage(const char* prog_name) {
     printf("  -h, --help            Show this help\n");
     printf("  -v, --version         Show version information\n");
     printf("  --no-auto-save        Disable auto-save on exit\n");
-    printf("  --no-monitoring       Disable health monitoring\n");
 }
 
 static void print_version(void) {
-    printf("KV Store CLI v%d.%d.%d\n", KVSTORE_VERSION_MAJOR, KVSTORE_VERSION_MINOR, KVSTORE_VERSION_PATCH);
+    printf("KV Store CLI v%d.%d.%d (KVAPI wrapper)\n", KVSTORE_VERSION_MAJOR, KVSTORE_VERSION_MINOR,
+           KVSTORE_VERSION_PATCH);
 }
 
 int main(int argc, char** argv) {
@@ -954,7 +924,7 @@ int main(int argc, char** argv) {
     }
 
     // Setup logging and signals
-    logger(LOG_INFO, "KV Store CLI starting");
+    kv_log(LOG_INFO, "KV Store CLI starting (KVAPI mode)");
     setup_signals();
 
     // Load configuration
@@ -963,29 +933,20 @@ int main(int argc, char** argv) {
     // Setup readline
     setup_readline();
 
-    // Create store with error checking
-    g_store = kvstore_create(g_config.capacity);
-    if (!g_store) {
-        logger(LOG_ERROR, "Failed to create store with capacity %zu", g_config.capacity);
+    // Create API handle with config
+    kvapi_config_t api_config = {
+        .capacity           = g_config.capacity,
+        .db_file            = g_config.db_file,
+        .auto_save          = g_config.auto_save,
+        .auto_save_interval = g_config.auto_save_interval,
+    };
+    g_api = kvapi_init(&api_config);
+    if (!g_api) {
+        kv_log(LOG_ERROR, "Failed to create KVAPI handle with capacity %zu", g_config.capacity);
         return 1;
     }
 
-    logger(LOG_INFO, "Store created with capacity %zu", g_config.capacity);
-
-    // Load existing data
-    LOCK_STORE();
-    kvstore_error_t error = kvstore_load(g_store, g_config.db_file);
-    UNLOCK_STORE();
-
-    if (error != KVSTORE_OK && error != KVSTORE_ERROR_IO) {
-        logger(LOG_ERROR, "Failed to load database: %s", kvstore_error_string(error));
-        return 1;
-    } else if (error == KVSTORE_OK) {
-        size_t loaded = kvstore_size(g_store);
-        if (loaded > 0) {
-            logger(LOG_INFO, "Loaded %zu key-value pairs from %s", loaded, g_config.db_file);
-        }
-    }
+    kv_log(LOG_INFO, "KVAPI handle created with capacity %zu", g_config.capacity);
 
     int exit_code = 0;
 
@@ -995,6 +956,5 @@ int main(int argc, char** argv) {
     } else {
         repl();
     }
-
     return exit_code;
 }
