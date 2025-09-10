@@ -49,18 +49,18 @@ LIBS = -lreadline -lm
 
 # Source files
 LIB_SOURCES = $(wildcard $(SRCDIR)/*.c)
-CLI_SOURCES = kv-cli.c
+CLI_SOURCES = kv-server-cli.c
 SERVER_SOURCES = kv-server.c
 
 # Object files
 LIB_OBJECTS = $(LIB_SOURCES:$(SRCDIR)/%.c=$(OBJDIR)/%.o)
-CLI_OBJECTS = $(OBJDIR)/kv-cli.o
+CLI_OBJECTS = $(OBJDIR)/kv-server-cli.o
 SERVER_OBJECTS = $(OBJDIR)/kv-server.o
 
 # Targets
 STATIC_LIB = $(LIBDIR)/lib$(PROJECT).a
 SHARED_LIB = $(LIBDIR)/lib$(PROJECT).so
-CLI_BINARY = $(BINDIR)/kv-cli
+CLI_BINARY = $(BINDIR)/kv-server-cli
 SERVER_BINARY = $(BINDIR)/kv-server
 
 # Header files for installation
@@ -144,7 +144,7 @@ install-shared: $(SHARED_LIB) $(CLI_BINARY)
 
 uninstall:
 	@echo "Uninstalling from $(PREFIX)..."
-	@rm -f $(INSTALL_BINDIR)/kv-cli
+	@rm -f $(INSTALL_BINDIR)/kv-server-cli
 	@rm -f $(INSTALL_BINDIR)/kv-server
 	@rm -f $(INSTALL_LIBDIR)/lib$(PROJECT).a
 	@rm -f $(INSTALL_LIBDIR)/lib$(PROJECT).so
@@ -181,11 +181,17 @@ clean:
 	@echo "Cleaning build artifacts..."
 	@rm -rf $(BUILDDIR)
 	@rm -f *.gcov *.gcda *.gcno coverage.info
+	$(MAKE) -C client clean
 
 distclean: clean
 	@echo "Cleaning distribution files..."
 	@rm -f *.tar.gz
 	@rm -rf $(PROJECT)-*/
+
+.PHONY: client
+client:
+	$(MAKE) -C client
+	cp -f client/kv-client $(BUILDDIR)/bin
 
 # Dependency tracking (automatic header dependencies)
 DEPS = $(LIB_OBJECTS:.o=.d) $(CLI_OBJECTS:.o=.d) $(SERVER_OBJECTS:.o=.d)
